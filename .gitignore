@@ -1,0 +1,7 @@
+.env
+firebase-credentials.json
+*-credentials.json
+sa-key.json
+models/
+.venv/
+__pycache__/
