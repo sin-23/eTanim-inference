@@ -1,10 +1,14 @@
 """
 e-Tanim Mini PC harvest-detection service.
 
-Current pipeline:
-  Camera -> Orchestrator -> Detection -> Firebase test upload
+Current pipeline (tomato):
+  Camera -> Orchestrator (with tracker ID) -> 224x224 crop -> Tomato evaluator
+  -> ripeness counters -> Firebase upload
 
-Evaluator models are not available yet, so maturity fields remain 0.
+Each detected tomato gets a tracker ID. The 224x224 crop around it is sent to
+the evaluator, and the label is remembered per ID so the same fruit is not
+re-classified on every frame. Other crops are detected but have no evaluator
+yet, so their counters remain 0.
 
 Run:
   python detect_and_upload.py
@@ -25,7 +29,8 @@ log = logging.getLogger("etanim")
 
 RTDB_URL = os.getenv("FIREBASE_RTDB_URL")
 CRED_PATH = os.getenv("FIREBASE_CREDENTIALS_PATH", "firebase-credentials.json")
-ORCH_MODEL = os.getenv("ORCHESTRATOR_MODEL", "models/best (7).pt")
+ORCH_MODEL = os.getenv("ORCHESTRATOR_MODEL", "models/best.pt")
+TOMATO_CLS_MODEL = os.getenv("TOMATO_CLS_MODEL", "models/tomato.pt")
 
 CAMERA_INDEX = int(os.getenv("CAMERA_INDEX", "0"))
 ROUTE_CONF = float(os.getenv("ROUTE_CONF", "0.70"))
@@ -34,6 +39,18 @@ FIREBASE_TEST_INTERVAL = int(os.getenv("FIREBASE_TEST_INTERVAL", "30"))
 
 CROPS = {"tomato", "eggplant", "bell_pepper"}
 MIN_BOX_PX = 16
+
+CROP_SIZE = 224
+CLS_REFRESH = int(os.getenv("CLS_REFRESH", "600"))  # seconds before an ID is re-classified
+
+# Evaluator class name -> counter field the website reads.
+LABEL_KEYS = {
+    "unripe": "underripe",
+    "underripe": "underripe",
+    "ripe": "ripe",
+    "rotten": "damaged",
+    "damaged": "damaged",
+}
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -59,6 +76,31 @@ def apply_clahe(frame):
     )
 
 
+def crop_224(frame, box):
+    """224x224 window centred on the box, shifted to stay inside the frame."""
+
+    import cv2
+
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = box
+
+    cx = (x1 + x2) // 2
+    cy = (y1 + y2) // 2
+
+    half = CROP_SIZE // 2
+
+    x0 = min(max(0, cx - half), max(0, w - CROP_SIZE))
+    y0 = min(max(0, cy - half), max(0, h - CROP_SIZE))
+
+    patch = frame[y0:y0 + CROP_SIZE, x0:x0 + CROP_SIZE]
+
+    # Only happens if the frame itself is smaller than 224 px.
+    if patch.shape[0] != CROP_SIZE or patch.shape[1] != CROP_SIZE:
+        patch = cv2.resize(patch, (CROP_SIZE, CROP_SIZE))
+
+    return patch
+
+
 # ── Model ────────────────────────────────────────────────────────────────────
 
 class Models:
@@ -71,12 +113,38 @@ class Models:
                 f"Orchestrator model not found: {ORCH_MODEL}"
             )
 
+        if not os.path.exists(TOMATO_CLS_MODEL):
+            raise FileNotFoundError(
+                f"Tomato evaluator model not found: {TOMATO_CLS_MODEL}"
+            )
+
         self.orch = YOLO(ORCH_MODEL)
+        self.tomato_cls = YOLO(TOMATO_CLS_MODEL)
 
         log.info(
             "Orchestrator classes: %s",
             self.orch.names
         )
+
+        log.info(
+            "Tomato evaluator classes: %s",
+            self.tomato_cls.names
+        )
+
+        unknown = [
+            n for n in self.tomato_cls.names.values()
+            if normalize(n) not in LABEL_KEYS
+        ]
+
+        if unknown:
+            raise RuntimeError(
+                "Tomato evaluator classes are not ripeness labels: "
+                f"{unknown[:5]}. Use the trained unripe/ripe/rotten "
+                "weights, or add the class names to LABEL_KEYS."
+            )
+
+        # tracker ID -> (counter field, evaluator confidence, time classified)
+        self.labels = {}
 
 
 # ── Detection ────────────────────────────────────────────────────────────────
@@ -88,8 +156,10 @@ def detect(models, frame):
 
     h, w = frame.shape[:2]
 
-    result = models.orch(
+    result = models.orch.track(
         frame,
+        persist=True,
+        tracker="bytetrack.yaml",
         conf=0.25,
         verbose=False
     )[0]
@@ -123,20 +193,71 @@ def detect(models, frame):
         if x2 - x1 < MIN_BOX_PX or y2 - y1 < MIN_BOX_PX:
             continue
 
+        # box.id is None until the tracker has confirmed the object.
+        track_id = int(box.id[0]) if box.id is not None else None
+
         detections.append(
-            (crop, conf, (x1, y1, x2, y2))
+            (crop, conf, (x1, y1, x2, y2), track_id)
         )
 
     return detections
 
 
-def draw_detections(frame, detections):
+def evaluate(models, frame, detections):
+    """Return one counter field (or None) per detection, in the same order."""
+
+    labels = []
+    now = time.time()
+
+    for crop, _, box, track_id in detections:
+
+        if crop != "tomato":
+            labels.append(None)
+            continue
+
+        cached = models.labels.get(track_id)
+
+        if cached and now - cached[2] < CLS_REFRESH:
+            labels.append(cached[0])
+            continue
+
+        result = models.tomato_cls(
+            crop_224(frame, box),
+            verbose=False
+        )[0]
+
+        top = int(result.probs.top1)
+        cls_conf = float(result.probs.top1conf)
+        label = LABEL_KEYS[normalize(result.names[top])]
+
+        if track_id is not None:
+            models.labels[track_id] = (label, cls_conf, now)
+
+        log.info(
+            "Tomato #%s -> %s (%.2f)",
+            track_id,
+            label,
+            cls_conf
+        )
+
+        labels.append(label)
+
+    return labels
+
+
+def draw_detections(frame, detections, labels):
 
     import cv2
 
-    for crop, conf, (x1, y1, x2, y2) in detections:
+    for (crop, conf, (x1, y1, x2, y2), track_id), label in zip(
+        detections,
+        labels
+    ):
 
-        label = f"{crop} {conf:.2f}"
+        text = f"#{track_id} {crop} {conf:.2f}"
+
+        if label:
+            text += f" {label}"
 
         cv2.rectangle(
             frame,
@@ -148,7 +269,7 @@ def draw_detections(frame, detections):
 
         cv2.putText(
             frame,
-            label,
+            text,
             (x1, max(25, y1 - 8)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7,
@@ -187,23 +308,32 @@ def init_firebase():
     return db
 
 
-def upload_test(fb_db, detections):
+def upload_test(fb_db, detections, labels):
 
     if not detections:
         return
 
     by_crop = {}
 
-    for crop, conf, _ in detections:
-        by_crop.setdefault(crop, []).append(conf)
+    for (crop, conf, _, _), label in zip(detections, labels):
 
-    for crop, confidences in by_crop.items():
+        entry = by_crop.setdefault(
+            crop,
+            {"confidences": [], "underripe": 0, "ripe": 0, "damaged": 0}
+        )
+
+        entry["confidences"].append(conf)
+
+        if label:
+            entry[label] += 1
+
+    for crop, entry in by_crop.items():
 
         payload = {
-            "underripe": 0,
-            "ripe": 0,
-            "damaged": 0,
-            "confidence": round(max(confidences), 2),
+            "underripe": entry["underripe"],
+            "ripe": entry["ripe"],
+            "damaged": entry["damaged"],
+            "confidence": round(max(entry["confidences"]), 2),
             "updatedAt": int(time.time() * 1000)
         }
 
@@ -255,17 +385,17 @@ def live(models, fb_db):
                 frame
             )
 
-            for crop, conf, box in detections:
-                log.info(
-                    "Detected %s %.2f at %s",
-                    crop,
-                    conf,
-                    box
-                )
+            # Crop from the untouched frame, before boxes are drawn on it.
+            labels = evaluate(
+                models,
+                frame,
+                detections
+            )
 
             display = draw_detections(
                 frame,
-                detections
+                detections,
+                labels
             )
 
             cv2.imshow(
@@ -283,7 +413,8 @@ def live(models, fb_db):
                 try:
                     upload_test(
                         fb_db,
-                        detections
+                        detections,
+                        labels
                     )
                     last_upload = now
                 except Exception:
@@ -331,12 +462,23 @@ def once(models, fb_db):
             frame
         )
 
-        for crop, conf, box in detections:
+        labels = evaluate(
+            models,
+            frame,
+            detections
+        )
+
+        for (crop, conf, box, track_id), label in zip(
+            detections,
+            labels
+        ):
             log.info(
-                "Detected %s %.2f at %s",
+                "Detected #%s %s %.2f at %s -> %s",
+                track_id,
                 crop,
                 conf,
-                box
+                box,
+                label
             )
 
         log.info(
@@ -347,7 +489,8 @@ def once(models, fb_db):
         if fb_db and detections:
             upload_test(
                 fb_db,
-                detections
+                detections,
+                labels
             )
 
     finally:
