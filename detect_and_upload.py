@@ -5,7 +5,9 @@ Current pipeline (tomato):
   Camera -> Orchestrator (with tracker ID) -> 224x224 crop -> Tomato evaluator
   -> ripeness counters -> Firebase upload
 
-Each detected tomato gets a tracker ID. The 224x224 crop around it is sent to
+Each detected fruit gets a tracker ID that is also uploaded (detections/{crop}/fruits)
+so the dashboard can list fruits by ID. Newly ripe fruits trigger a harvest_ready
+notification. The 224x224 crop around it is sent to
 the evaluator, and the label is remembered per ID so the same fruit is not
 re-classified on every frame. Other crops are detected but have no evaluator
 yet, so their counters remain 0.
@@ -42,6 +44,12 @@ MIN_BOX_PX = 16
 
 CROP_SIZE = 224
 CLS_REFRESH = int(os.getenv("CLS_REFRESH", "600"))  # seconds before an ID is re-classified
+
+# Harvest-ready notifications (RTDB notifications/{pushId}).
+NOTIFY_MIN_CONF = float(os.getenv("NOTIFY_MIN_CONF", "0.80"))   # evaluator confidence needed for "ripe"
+NOTIFY_COOLDOWN = int(os.getenv("NOTIFY_COOLDOWN", "300"))      # seconds between notifications per crop
+NOTIFY_SOURCE = os.getenv("NOTIFY_SOURCE", f"minipc/camera-{CAMERA_INDEX}")
+MAX_FRUITS = 30                                                 # per-crop cap on the uploaded fruit list
 
 # Evaluator class name -> counter field the website reads.
 LABEL_KEYS = {
@@ -145,6 +153,11 @@ class Models:
 
         # tracker ID -> (counter field, evaluator confidence, time classified)
         self.labels = {}
+
+        # (crop, tracker ID) pairs already announced as ripe, and the time of
+        # the last notification per crop.
+        self.notified = set()
+        self.last_notify = {}
 
 
 # ── Detection ────────────────────────────────────────────────────────────────
@@ -315,17 +328,34 @@ def upload_test(fb_db, detections, labels):
 
     by_crop = {}
 
-    for (crop, conf, _, _), label in zip(detections, labels):
+    for (crop, conf, _, track_id), label in zip(detections, labels):
 
         entry = by_crop.setdefault(
             crop,
-            {"confidences": [], "underripe": 0, "ripe": 0, "damaged": 0}
+            {
+                "confidences": [],
+                "underripe": 0,
+                "ripe": 0,
+                "damaged": 0,
+                "fruits": []
+            }
         )
 
         entry["confidences"].append(conf)
 
         if label:
             entry[label] += 1
+
+        # Per-fruit row for the dashboard. Only tracker-confirmed fruits have
+        # an ID. A list (not a map keyed by number) is used because RTDB turns
+        # maps with consecutive integer keys into arrays.
+        if track_id is not None and len(entry["fruits"]) < MAX_FRUITS:
+            fruit = {"id": track_id, "confidence": round(conf, 2)}
+
+            if label:
+                fruit["stage"] = label
+
+            entry["fruits"].append(fruit)
 
     for crop, entry in by_crop.items():
 
@@ -337,15 +367,76 @@ def upload_test(fb_db, detections, labels):
             "updatedAt": int(time.time() * 1000)
         }
 
+        if entry["fruits"]:
+            payload["fruits"] = sorted(
+                entry["fruits"],
+                key=lambda f: f["id"]
+            )
+
         fb_db.reference(
             f"detections/{crop}"
         ).set(payload)
 
         log.info(
-            "[Firebase TEST] detections/%s <- %s",
+            "[Firebase] detections/%s <- %s",
             crop,
             payload
         )
+
+
+def notify_ripe(models, fb_db, detections, labels):
+    """Push one harvest_ready notification per crop when a fruit newly turns
+    up ripe. Runs every frame (not on the 30 s upload timer) so the alert is
+    immediate. Each (crop, tracker ID) is announced once, and a per-crop
+    cooldown groups fruits that ripen close together into one message."""
+
+    now = time.time()
+    fresh = {}
+
+    for (crop, _, _, track_id), label in zip(detections, labels):
+
+        if label != "ripe" or track_id is None:
+            continue
+
+        if (crop, track_id) in models.notified:
+            continue
+
+        cached = models.labels.get(track_id)
+
+        if cached and cached[1] < NOTIFY_MIN_CONF:
+            continue
+
+        fresh.setdefault(crop, []).append(track_id)
+
+    for crop, ids in fresh.items():
+
+        if now - models.last_notify.get(crop, 0) < NOTIFY_COOLDOWN:
+            continue
+
+        ids = sorted(set(ids))
+        name = crop.replace("_", " ").title()
+        tags = ", ".join(f"#{i}" for i in ids)
+
+        payload = {
+            "type": "harvest_ready",
+            "source": NOTIFY_SOURCE,
+            "message": f"{name} ready to harvest: {tags}"[:200],
+            "createdAt": int(now * 1000)
+        }
+
+        if fb_db is None:
+            log.info("[dry-run] would notify: %s", payload)
+        else:
+            try:
+                fb_db.reference("notifications").push(payload)
+            except Exception:
+                log.exception("Notification push failed.")
+                continue
+
+            log.info("[Firebase] notifications <- %s", payload)
+
+        models.last_notify[crop] = now
+        models.notified.update((crop, i) for i in ids)
 
 
 # ── Live mode ────────────────────────────────────────────────────────────────
@@ -390,6 +481,13 @@ def live(models, fb_db):
                 models,
                 frame,
                 detections
+            )
+
+            notify_ripe(
+                models,
+                fb_db,
+                detections,
+                labels
             )
 
             display = draw_detections(
@@ -484,6 +582,13 @@ def once(models, fb_db):
         log.info(
             "Detection cycle complete: %d detection(s)",
             len(detections)
+        )
+
+        notify_ripe(
+            models,
+            fb_db,
+            detections,
+            labels
         )
 
         if fb_db and detections:

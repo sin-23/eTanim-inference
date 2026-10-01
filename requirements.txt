@@ -2,3 +2,4 @@ ultralytics
 opencv-python
 firebase-admin
 python-dotenv
+openvino
